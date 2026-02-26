@@ -1,5 +1,7 @@
 .env
 *.session
+*.session-journal
 __pycache__/
 *.pyc
 logs/
+user_settings.json

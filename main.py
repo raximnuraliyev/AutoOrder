@@ -11,13 +11,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import AuthKeyDuplicatedError
 
 import config
+import settings
+from commands import register_commands
 from logger import log
+from notifier import notify_error, notify_info
 from order_logic import run_order
 
 
@@ -51,86 +57,170 @@ async def run_once():
     """Connect using saved session, execute order, disconnect."""
     client = _build_client()
 
-    async with client:
-        if not await client.is_user_authorized():
-            log.error(
-                "No active session. Run `python main.py --login` first."
-            )
-            sys.exit(1)
+    try:
+        async with client:
+            if not await client.is_user_authorized():
+                log.error(
+                    "No active session. Run `python main.py --login` first."
+                )
+                sys.exit(1)
 
-        me = await client.get_me()
-        log.info(f"Session active: {me.first_name} (id={me.id})")
+            me = await client.get_me()
+            log.info(f"Session active: {me.first_name} (id={me.id})")
 
-        success = await run_order(client)
-        status = "SUCCESS" if success else "FAILED"
-        log.info(f"══════════ Run finished: {status} ══════════")
-        return success
+            success = await run_order(client)
+            status = "SUCCESS" if success else "FAILED"
+            log.info(f"══════════ Run finished: {status} ══════════")
+            return success
+    except AuthKeyDuplicatedError:
+        _handle_auth_key_error()
+        return False
+
+
+def _handle_auth_key_error():
+    """Handle AuthKeyDuplicatedError by deleting the corrupt session."""
+    session_file = Path(config.SESSION_PATH + ".session")
+    journal_file = Path(config.SESSION_PATH + ".session-journal")
+    log.error(
+        "\n"
+        "═══════════════════════════════════════════════════════════\n"
+        "  SESSION INVALIDATED (AuthKeyDuplicatedError)\n"
+        "\n"
+        "  The session was used from two different IPs at once.\n"
+        "  Telegram revoked it permanently.\n"
+        "\n"
+        "  FIX: Run `python main.py --login` to create a new session.\n"
+        "═══════════════════════════════════════════════════════════"
+    )
+    # Delete the corrupt session files
+    for f in (session_file, journal_file):
+        try:
+            if f.exists():
+                f.unlink()
+                log.info(f"Deleted corrupt session file: {f}")
+        except OSError as exc:
+            log.warning(f"Could not delete {f}: {exc}")
 
 
 # ─── Daemon mode (24/7 for Wispbyte / server) ──────────────────
 async def daemon():
     """
     Long-running process. Stays alive permanently.
-    Fires the order once per day at the configured hour (Tashkent time).
+
+    - Checks at EACH configured hour whether food is ordered.
+      (e.g., schedule = [8, 14, 17] → checks at 8 AM, 2 PM, 5 PM)
+    - Per-hour tracking: each hour fires independently, so the bot
+      can retry at 14:00 even if 8:00 failed.
+    - Listens for Telegram commands in Saved Messages.
+    - Sends notifications to the user on errors / success.
     """
     client = _build_client()
 
-    async with client:
-        if not await client.is_user_authorized():
-            log.error(
-                "No active session. Run `python main.py --login` first."
+    try:
+        async with client:
+            if not await client.is_user_authorized():
+                log.error(
+                    "No active session. Run `python main.py --login` first."
+                )
+                sys.exit(1)
+
+            me = await client.get_me()
+            log.info(f"Session active: {me.first_name} (id={me.id})")
+
+            # ── Shared state ─────────────────────────────────────────
+            # Track which (date, hour) combos have already been handled
+            completed_runs: set[str] = set()   # "2025-06-15@8", "2025-06-15@14"
+            last_heartbeat_hour: int = -1
+            last_order_date: str | None = None
+
+            def _get_last_order_date() -> str | None:
+                return last_order_date
+
+            # ── Register command handler ─────────────────────────────
+            register_commands(
+                client,
+                force_order_callback=run_order,
+                get_last_order_date=_get_last_order_date,
             )
-            sys.exit(1)
 
-        me = await client.get_me()
-        log.info(f"Session active: {me.first_name} (id={me.id})")
-        log.info(
-            f"Daemon running 24/7. Scheduled hours (Tashkent): "
-            f"{config.SCHEDULE_HOURS}"
-        )
+            schedule_hours = settings.get_schedule_hours()
+            selected_meals = settings.get_selected_meals()
+            hours_str = ", ".join(f"{h}:00" for h in schedule_hours)
+            meals_str = ", ".join(selected_meals)
+            log.info(
+                f"Daemon running 24/7.\n"
+                f"  Schedule (Tashkent): {hours_str}\n"
+                f"  Meals: {meals_str}\n"
+                f"  Enabled: {settings.is_enabled()}"
+            )
 
-        last_order_date: str | None = None
-        last_heartbeat_hour: int = -1
+            await notify_info(
+                client,
+                f"AutoOrder daemon started.\n"
+                f"Schedule: {hours_str}\n"
+                f"Meals: {meals_str}\n"
+                f"Send /help in Saved Messages for commands.",
+            )
 
-        while True:
-            now = datetime.now(tz=config.TIMEZONE)
-            today = now.strftime("%Y-%m-%d")
+            while True:
+                now = datetime.now(tz=config.TIMEZONE)
+                today = now.strftime("%Y-%m-%d")
+                run_key = f"{today}@{now.hour}"
 
-            # ── Heartbeat (once per hour) ────────────────────────
-            if now.hour != last_heartbeat_hour:
-                log.info(
-                    f"♥ Daemon alive — {now.strftime('%Y-%m-%d %H:%M')} Tashkent"
-                )
-                last_heartbeat_hour = now.hour
+                # ── Heartbeat (once per hour) ────────────────────────
+                if now.hour != last_heartbeat_hour:
+                    log.info(
+                        f"♥ Daemon alive — {now.strftime('%Y-%m-%d %H:%M')} Tashkent"
+                    )
+                    last_heartbeat_hour = now.hour
 
-            # ── Fire order at scheduled hour ─────────────────────
-            if now.hour in config.SCHEDULE_HOURS and last_order_date != today:
-                log.info(
-                    f"⏰ Schedule triggered: "
-                    f"{now.strftime('%H:%M')} Tashkent time"
-                )
-                try:
-                    success = await run_order(client)
-                    if success:
-                        last_order_date = today
-                        log.info(
-                            f"Order complete for {today}. "
-                            f"Next check tomorrow."
+                # ── Re-read settings each cycle (user may have changed) ──
+                schedule_hours = settings.get_schedule_hours()
+                enabled = settings.is_enabled()
+
+                # ── Fire order at each scheduled hour ────────────────
+                if (
+                    enabled
+                    and now.hour in schedule_hours
+                    and run_key not in completed_runs
+                ):
+                    log.info(
+                        f"⏰ Schedule triggered: "
+                        f"{now.strftime('%H:%M')} Tashkent time"
+                    )
+                    try:
+                        success = await run_order(client)
+                        if success:
+                            last_order_date = today
+                            log.info(
+                                f"Order complete for {today} at {now.hour}:00. "
+                            )
+                        else:
+                            log.warning(
+                                f"Order run returned failure at {now.hour}:00. "
+                                "Marking this hour as done."
+                            )
+                    except Exception as exc:
+                        log.exception(f"Daemon order run crashed: {exc}")
+                        await notify_error(
+                            client,
+                            f"Daemon crash at {now.hour}:00:\n{exc}",
+                            kind="crash",
                         )
-                    else:
-                        log.warning(
-                            "Order run returned failure. "
-                            "Will NOT retry today (meals may be partially set)."
-                        )
-                        # Mark as done to avoid infinite retry loops
-                        last_order_date = today
-                except Exception as exc:
-                    log.exception(f"Daemon order run crashed: {exc}")
-                    # Still mark to prevent spam-retrying
-                    last_order_date = today
 
-            # ── Sleep between checks ─────────────────────────────
-            await asyncio.sleep(30)
+                    # Mark this (date, hour) as done regardless of outcome
+                    completed_runs.add(run_key)
+
+                    # Clean up old entries (keep only today's)
+                    old_keys = [k for k in completed_runs if not k.startswith(today)]
+                    for k in old_keys:
+                        completed_runs.discard(k)
+
+                # ── Sleep between checks ─────────────────────────────
+                await asyncio.sleep(30)
+    except AuthKeyDuplicatedError:
+        _handle_auth_key_error()
+        sys.exit(1)
 
 
 # ─── CLI ────────────────────────────────────────────────────────
