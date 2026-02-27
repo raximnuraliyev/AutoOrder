@@ -267,6 +267,7 @@ def register_commands(
     client: TelegramClient,
     force_order_callback: ForceOrderCallback | None = None,
     get_last_order_date: Callable[[], str | None] | None = None,
+    cached_me=None,
 ) -> None:
     """
     Register the Saved Messages event handler on the client.
@@ -275,7 +276,9 @@ def register_commands(
         client: Connected TelegramClient.
         force_order_callback: async fn(client) -> bool for /order.
         get_last_order_date: fn() -> str|None for /status.
+        cached_me: Pre-fetched 'me' entity to avoid repeated get_me() calls.
     """
+    _cached_me = cached_me  # closure over the cached value
 
     @client.on(events.NewMessage(
         # Only handle messages from self → self (Saved Messages)
@@ -283,12 +286,14 @@ def register_commands(
         incoming=False,
     ))
     async def _on_saved_message(event: events.NewMessage.Event):
-        # Only react to messages in Saved Messages (chat with self)
-        me = await client.get_me()
+        nonlocal _cached_me
+        # Use cached 'me' to avoid repeated API calls (saves memory & latency)
+        if _cached_me is None:
+            _cached_me = await client.get_me()
         chat = await event.get_chat()
 
         # Saved Messages = chat where peer is yourself
-        if getattr(chat, "id", None) != me.id:
+        if getattr(chat, "id", None) != _cached_me.id:
             return
 
         text = (event.raw_text or "").strip()

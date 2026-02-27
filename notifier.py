@@ -12,12 +12,19 @@ from logger import log
 import settings
 
 
+# Cache the user entity to avoid repeated get_me() calls
+_me_cache = None
+
+
 async def _send(client: TelegramClient, text: str) -> None:
     """Low-level: send a message to Saved Messages (always)."""
+    global _me_cache
     try:
-        me = await client.get_me()
-        await client.send_message(me.id, text)
+        if _me_cache is None:
+            _me_cache = await client.get_me()
+        await client.send_message(_me_cache.id, text)
     except Exception as exc:
+        _me_cache = None  # reset cache on failure
         log.error(f"Failed to send notification: {exc}")
 
 

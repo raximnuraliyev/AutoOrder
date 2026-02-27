@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import os
 import sys
 from datetime import datetime
@@ -28,7 +29,7 @@ from order_logic import run_order
 
 
 def _build_client() -> TelegramClient:
-    """Construct a Telethon client from config."""
+    """Construct a Telethon client from config (memory-optimised)."""
     if not config.API_ID or not config.API_HASH:
         log.error("API_ID / API_HASH not set. Check your .env file.")
         sys.exit(1)
@@ -37,6 +38,10 @@ def _build_client() -> TelegramClient:
         config.SESSION_PATH,
         config.API_ID,
         config.API_HASH,
+        # ── Memory optimisation for 512 MB servers ──
+        entity_cache_limit=100,        # default 5000 — saves ~10-20 MB
+        request_retries=3,
+        flood_sleep_threshold=30,       # don't hold huge sleep state
     )
 
 
@@ -136,11 +141,12 @@ async def daemon():
             def _get_last_order_date() -> str | None:
                 return last_order_date
 
-            # ── Register command handler ─────────────────────────────
+            # ── Register command handler (pass cached me) ────────────
             register_commands(
                 client,
                 force_order_callback=run_order,
                 get_last_order_date=_get_last_order_date,
+                cached_me=me,
             )
 
             schedule_hours = settings.get_schedule_hours()
@@ -216,8 +222,11 @@ async def daemon():
                     for k in old_keys:
                         completed_runs.discard(k)
 
-                # ── Sleep between checks ─────────────────────────────
-                await asyncio.sleep(30)
+                # ── Periodic garbage collection to free memory ────
+                gc.collect()
+
+                # ── Sleep between checks (60s saves CPU on low-RAM host)
+                await asyncio.sleep(60)
     except AuthKeyDuplicatedError:
         _handle_auth_key_error()
         sys.exit(1)

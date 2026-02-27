@@ -106,7 +106,7 @@ async def _poll_for_buttons(
         timeout = config.POLL_TIMEOUT
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
-        messages = await client.get_messages(bot_entity, limit=5)
+        messages = await client.get_messages(bot_entity, limit=2)  # was 5
         for msg in messages:
             if msg.buttons:
                 return msg
@@ -125,7 +125,7 @@ async def _poll_for_meal_buttons(
         timeout = config.POLL_TIMEOUT
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
-        messages = await client.get_messages(bot_entity, limit=5)
+        messages = await client.get_messages(bot_entity, limit=2)  # was 5
         for msg in messages:
             if _has_meal_buttons(msg, meal_list):
                 return msg
@@ -247,7 +247,7 @@ async def execute_order(client: TelegramClient) -> bool:
     # ── STEP 6: Verify final state ───────────────────────────────
     await asyncio.sleep(config.DELAY_AFTER_ORDER)
 
-    final_messages = await client.get_messages(bot, limit=3)
+    final_messages = await client.get_messages(bot, limit=2)  # was 3
     for fmsg in final_messages:
         text = fmsg.text or ""
         final_ordered = _get_already_ordered_meals(text, selected_meals)
